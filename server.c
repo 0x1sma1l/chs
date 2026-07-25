@@ -8,11 +8,21 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/select.h>
+
+#define MAX_CLIENTS 50
 
 struct http_request {
     char method[8];
     char path[256];
     char version[16];
+};
+
+struct client_state {
+    int fd;
+    char buf[4096];
+    size_t buf_len;   // how many bytes currently accumulated
+    int in_use;       // is this slot occupied by a real client, or free?
 };
 
 int parse_request(char* raw_request, struct http_request *out) {
@@ -156,81 +166,14 @@ void send_file_response(int client_fd, int file_fd, size_t file_size) {
     }
 }
 
-int handle_client(int client_fd) {
-    char in_buf[1024];
-    ssize_t in_n_bytes;
-    char* body = "Hello, world!\n";
-    char *root = "./public";
-    char resolved[PATH_MAX];
-
-    struct http_request req;
-    struct stat file_stat;
-
-    /* read incoming bytes from client */
-    /* currently handling one read and parse per connection which isn't rich esp for keep-alive connections expected by most browsers but that's a fix for the near future */
-
-    /* TODO: loop read and parse to account for keep-alive connection */
-    in_n_bytes = read(client_fd, in_buf, sizeof(in_buf) - 1);
-
-    if (in_n_bytes < 0) {
-        perror("failed to read bytes from request");
-        exit(EXIT_FAILURE);
-    }
-
-    in_buf[in_n_bytes] = '\0'; // null terminate so we don't read beyond what we should
-
-    int res = parse_request(in_buf, &req);
-
-    if (res < 0) {
-        send_response(client_fd, 400, "Bad Request", "");
-        close(client_fd);
-
-        return -1;
-    }
-
-    /* resolving path to prevent path traversal and handle path mismatch */
-    int resolve_res = resolve_safe_path(root, req.path, resolved);
-
-    if (resolve_res < 0) {
-        send_response(client_fd, 404, "Not Found", "");
-        close(client_fd);
-
-        return -1;
-    }
-
-    int file_fd = open(resolved, O_RDONLY);
-
-    if (file_fd < 0) {
-        perror("failed to open file");
-        send_response(client_fd, 404, "Not Found", "");
-        close(client_fd);
-        return -1;
-    }
-
-    if (fstat(file_fd, &file_stat) < 0) {
-        perror("failed to stat file");
-        close(file_fd);
-        send_response(client_fd, 500, "Internal Server Error", "");
-        close(client_fd);
-        return -1;
-    }
-    if (!S_ISREG(file_stat.st_mode)) {
-        close(file_fd);
-        send_response(client_fd, 404, "Not Found", "");
-        close(client_fd);
-        return -1;
-    }
-
-    send_file_response(client_fd, file_fd, file_stat.st_size); // already closing the connection within this fn.
-
-    return 0;
-}
-
 int main() {
     int server_fd;
     int rc;
+    fd_set readfds;
+    int nfds;
 
     struct sockaddr_in server_addr;
+    struct client_state clients[MAX_CLIENTS];
 
     /* create socket -> listen file descriptor */
     server_fd = socket(PF_INET, SOCK_STREAM, 0);
@@ -261,39 +204,150 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        clients[i].in_use = 0;
+    }
+
     while (1) {
-        int client_fd;
-        socklen_t client_len;
+        nfds = 0;
+        FD_ZERO(&readfds);
+        FD_SET(server_fd, &readfds);
 
-        struct sockaddr_in client_addr;
+        if (server_fd >= nfds) nfds = server_fd + 1;
 
-        memset(&client_addr, 0, sizeof(client_addr)); // zero-ing the client addr struct to avoid surprises :)
-        client_len = sizeof(client_addr);
+        for(int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].in_use == 1) {
+                FD_SET(clients[i].fd, &readfds);
 
-        /* accepting client connection (blocking) */
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                if (clients[i].fd >= nfds) {
+                    nfds = clients[i].fd + 1;
+                }
+            }
+        }
 
-        if (client_fd < 0) {
-            perror("Failed to accept incoming requests");
+        int ready = select(nfds, &readfds, NULL, NULL, NULL);
+        if (ready < 0) {
+            perror("select failed");
             exit(EXIT_FAILURE);
         }
 
-        /* fork happens here to create 2 process, parent and child */
-        /* parent falls back to accepting new connections and child handles the rest pertaining to the accepted conn... */
-        pid_t result = fork();
+        if (FD_ISSET(server_fd, &readfds)) {
+            int client_fd;
+            socklen_t client_len;
 
-        if (result < 0) {
-            perror("fork failed");
-            close(client_fd);
-        } else if (result == 0) {
-            // we are inside the child process
-            handle_client(client_fd);
-            exit(EXIT_SUCCESS);
-        } else {
-            // we are inside the parent process
-            close(client_fd);
-            waitpid(-1, NULL, WNOHANG);
-            continue;
+            struct sockaddr_in client_addr;
+
+            memset(&client_addr, 0, sizeof(client_addr)); // zero-ing the client addr struct to avoid surprises :)
+            client_len = sizeof(client_addr);
+
+            /* accepting client connection (blocking) */
+            client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+
+            if (client_fd < 0) {
+                perror("Failed to accept incoming requests");
+                exit(EXIT_FAILURE);
+            }
+
+            int slot_found = 0;
+
+            for (int i = 0; i < MAX_CLIENTS; i++) {
+                if (clients[i].in_use == 0) {
+                    clients[i].fd = client_fd;
+                    clients[i].in_use = 1;
+                    clients[i].buf_len = 0;
+                    slot_found = 1;
+
+                    break;
+                }
+            }
+
+            // if all slots are take, close connection...
+            if (!slot_found) close(client_fd);
+        }
+
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].in_use == 1) {
+                if (FD_ISSET(clients[i].fd, &readfds)) {
+                    struct client_state *client = &clients[i];
+                    ssize_t in_n_bytes;
+                    char *root = "./public";
+                    char resolved[PATH_MAX];
+
+                    struct http_request req;
+                    struct stat file_stat;
+
+                    in_n_bytes = read(client->fd, client->buf + client->buf_len, sizeof(client->buf) - client->buf_len);
+
+                    if (in_n_bytes > 0) {
+                        client->buf_len += in_n_bytes;
+                        client->buf[client->buf_len] = '\0';
+                        char *headers_end = strstr(client->buf, "\r\n\r\n");
+
+                        if (headers_end != NULL) {
+                            int res = parse_request(client->buf, &req);
+
+                            if (res < 0) {
+                                send_response(client->fd, 400, "Bad Request", "");
+                                close(client->fd);
+
+                                client->in_use = 0;
+                                continue;
+                            }
+
+                            /* resolving path to prevent path traversal and handle path mismatch */
+                            int resolve_res = resolve_safe_path(root, req.path, resolved);
+
+                            if (resolve_res < 0) {
+                                send_response(client->fd, 404, "Not Found", "");
+                                close(client->fd);
+
+                                client->in_use = 0;
+                                continue;
+                            }
+
+                            int file_fd = open(resolved, O_RDONLY);
+
+                            if (file_fd < 0) {
+                                perror("failed to open file");
+                                send_response(client->fd, 404, "Not Found", "");
+                                close(client->fd);
+
+                                client->in_use = 0;
+                                continue;
+                            }
+
+                            if (fstat(file_fd, &file_stat) < 0) {
+                                perror("failed to stat file");
+                                send_response(client->fd, 500, "Internal Server Error", "");
+                                close(client->fd);
+
+                                client->in_use = 0;
+                                continue;
+                            }
+
+                            if (!S_ISREG(file_stat.st_mode)) {
+                                send_response(client->fd, 404, "Not Found", "");
+                                close(file_fd);
+                                close(client->fd);
+
+                                client->in_use = 0;
+                                continue;
+                            }
+
+                            send_file_response(client->fd, file_fd, file_stat.st_size); // closing fd already done here
+
+                            client->in_use = 0;
+                        }
+                    } else if (in_n_bytes == 0) {
+                        close(client->fd);
+                        client->in_use = 0;
+                    } else {
+                        perror("failed to read");
+                        close(client->fd);
+                        client->in_use = 0;
+                    }
+                }
+            }
         }
     }
 
